@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Home } from './components/Home';
 import { CreatePage } from './components/CreatePage';
 import { CollectionsPage } from './components/CollectionsPage';
@@ -10,18 +10,20 @@ import { AlertModal } from './components/AlertModal';
 import { Footer } from './components/Footer';
 import { ethers } from 'ethers';
 import { getCollectionFactoryContract } from './blockchain/contracts/factoryContract';
-import { getNFTContract } from './blockchain/contracts/nftContract';
 import { getMarketplaceContract } from './blockchain/contracts/marketplaceContract';
+import { MARKETPLACE_ADDRESS } from './blockchain/contracts/addresses';
+import { SEPOLIA_CHAIN_ID } from './abi/networks';
 import { getErrorMessage, isUserRejection } from './blockchain/utils/errorMessages';
 import nftAbi from '@/abi/nftAbi.json';
 
-/** Resolve ipfs:// to a gateway URL */
+/** Resolve ipfs:// (and trim) for token URIs, collection images, and NFT metadata.image */
 function resolveTokenUri(uri: string): string {
-  if (!uri) return '';
-  if (uri.startsWith('ipfs://')) {
-    return uri.replace('ipfs://', 'https://ipfs.io/ipfs/');
+  const s = String(uri ?? '').trim();
+  if (!s) return '';
+  if (s.startsWith('ipfs://')) {
+    return s.replace('ipfs://', 'https://ipfs.io/ipfs/');
   }
-  return uri;
+  return s;
 }
 
 export type NFT = {
@@ -142,26 +144,27 @@ function App() {
     }
   }, [wallet, transactions]);
 
-  const fetchNFTs = async () => {
-    if (typeof window.ethereum === 'undefined') {
+  const fetchNFTs = useCallback(async () => {
+    const eth = window.ethereum;
+    if (eth === undefined) {
       setNfts([]);
       setLoading(false);
       return;
     }
     try {
-    const provider = new ethers.BrowserProvider(window.ethereum);
+    const provider = new ethers.BrowserProvider(eth);
     const factory = getCollectionFactoryContract(provider);
     const marketplace = getMarketplaceContract(provider);
 
     // 1. Get all collections from CollectionCreated events
     const createdEvents = await factory.queryFilter(factory.filters.CollectionCreated());
-    const collectionsList: { address: string; name: string; creator: string }[] = createdEvents.map(
-      (e) => ({
+    const collectionsList: { address: string; name: string; creator: string }[] = createdEvents
+      .filter((e): e is ethers.EventLog => e instanceof ethers.EventLog)
+      .map((e) => ({
         address: e.args?.collection ?? e.args?.[0],
         name: (e.args?.name ?? e.args?.[1])?.toString() ?? '',
         creator: (e.args?.creator ?? e.args?.[2]) ?? '',
-      })
-    );
+      }));
 
     const listingMap = new Map<
       string,
@@ -177,28 +180,44 @@ function App() {
     >();
 
     // 2. Build listing map from marketplace (listingId 1 .. nextListingId-1)
-    try {
-      const nextId = await marketplace.nextListingId();
-      const maxId = Number(nextId);
-      for (let listingId = 1; listingId < maxId; listingId++) {
-        const [listing, auction] = await Promise.all([
-          marketplace.listings(listingId),
-          marketplace.auctions(listingId),
-        ]);
-        if (!listing.active) continue;
-        const key = `${listing.nft.toLowerCase()}-${listing.tokenId.toString()}`;
-        listingMap.set(key, {
-          listingId,
-          price: listing.price,
-          saleType: Number(listing.saleType),
-          seller: listing.seller,
-          endTime: auction?.endTime,
-          highestBid: auction?.highestBid,
-          finalized: auction?.finalized,
-        });
+    const network = await provider.getNetwork();
+    const chainIdNum = Number(network.chainId);
+    const marketplaceBytecode = await provider.getCode(MARKETPLACE_ADDRESS);
+    const marketplaceDeployed =
+      marketplaceBytecode !== '0x' && marketplaceBytecode !== '0x0';
+
+    if (chainIdNum !== SEPOLIA_CHAIN_ID) {
+      console.warn(
+        `Marketplace listings skipped: connected chain is ${chainIdNum}; this build expects Sepolia (${SEPOLIA_CHAIN_ID}). Switch network or update contract addresses.`
+      );
+    } else if (!marketplaceDeployed) {
+      console.warn(
+        `Marketplace listings skipped: no contract at ${MARKETPLACE_ADDRESS} on this chain (eth_getCode returned empty). Often means wrong network or addresses.js is out of date after a redeploy.`
+      );
+    } else {
+      try {
+        const nextId = await marketplace.nextListingId();
+        const maxId = Number(nextId);
+        for (let listingId = 1; listingId < maxId; listingId++) {
+          const [listing, auction] = await Promise.all([
+            marketplace.listings(listingId),
+            marketplace.auctions(listingId),
+          ]);
+          if (!listing.active) continue;
+          const key = `${listing.nft.toLowerCase()}-${listing.tokenId.toString()}`;
+          listingMap.set(key, {
+            listingId,
+            price: listing.price,
+            saleType: Number(listing.saleType),
+            seller: listing.seller,
+            endTime: auction?.endTime,
+            highestBid: auction?.highestBid,
+            finalized: auction?.finalized,
+          });
+        }
+      } catch (e) {
+        console.warn('Marketplace listings fetch failed', e);
       }
-    } catch (e) {
-      console.warn('Marketplace listings fetch failed', e);
     }
 
     const fetchedNFTs: NFT[] = [];
@@ -212,7 +231,10 @@ function App() {
       const transferEvents = await nftContract.queryFilter(
         nftContract.filters.Transfer(zeroAddress)
       );
-      const tokenIds = transferEvents.map((e) => (e.args?.tokenId ?? e.args?.[2])?.toString()).filter(Boolean);
+      const tokenIds = transferEvents
+        .filter((e): e is ethers.EventLog => e instanceof ethers.EventLog)
+        .map((e) => (e.args?.tokenId ?? e.args?.[2])?.toString())
+        .filter(Boolean);
 
       for (const tokenIdStr of tokenIds) {
         try {
@@ -264,7 +286,7 @@ function App() {
             collection: collectionAddress,
             name: metadata?.name ?? `#${tokenIdStr}`,
             description: metadata?.description ?? '',
-            image: metadata?.image ?? '',
+            image: resolveTokenUri(typeof metadata?.image === 'string' ? metadata.image : ''),
             price,
             creator: metadata?.creator ?? col.creator,
             owner: uiOwner,
@@ -301,8 +323,8 @@ function App() {
         if (metadataURI && String(metadataURI).trim()) {
           const url = resolveTokenUri(String(metadataURI));
           const meta = await fetch(url).then((r) => r.json()).catch(() => null);
-          if (meta?.image && meta.image.trim()) {
-            collectionImage = meta.image.trim();
+          if (meta?.image && String(meta.image).trim()) {
+            collectionImage = resolveTokenUri(String(meta.image).trim());
           }
           if (meta?.name) collectionName = meta.name;
           if (meta?.description) collectionDescription = meta.description;
@@ -322,7 +344,7 @@ function App() {
         image: collectionImage,
         creator: col.creator,
         floorPrice: Number.isFinite(floorPrice) ? floorPrice : 0,
-        nftCount: available.length,
+        nftCount: colNfts.length,
       });
     }
     const newList = Array.from(collectionMap.values());
@@ -333,14 +355,18 @@ function App() {
         return { ...c, image };
       })
     );
+    } catch (err) {
+      console.warn('fetchNFTs failed', err);
+      setNfts([]);
+      setCollections([]);
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchNFTs();
-  }, []);
+  }, [fetchNFTs]);
 
   useEffect(() => {
     if (nfts.length === 0) return;
@@ -356,12 +382,33 @@ function App() {
         return {
           ...c,
           floorPrice: Number.isFinite(floorPrice) ? floorPrice : 0,
-          nftCount: available.length,
+          nftCount: colNfts.length,
           image: collectionImage,
         };
       })
     );
   }, [nfts]);
+
+  useEffect(() => {
+    const eth = window.ethereum;
+    if (!eth?.on) return;
+
+    const onAccountsChanged = (accounts: unknown) => {
+      const list = Array.isArray(accounts) ? accounts : [];
+      setWallet(list[0] ? String(list[0]) : null);
+    };
+
+    const onChainChanged = () => {
+      void fetchNFTs();
+    };
+
+    eth.on('accountsChanged', onAccountsChanged);
+    eth.on('chainChanged', onChainChanged);
+    return () => {
+      eth.removeListener?.('accountsChanged', onAccountsChanged);
+      eth.removeListener?.('chainChanged', onChainChanged);
+    };
+  }, [fetchNFTs]);
 
   const connectWallet = async () => {
     if (typeof window.ethereum === 'undefined') {
@@ -395,15 +442,13 @@ function App() {
 
   const disconnectWallet = () => {
     setWallet(null);
-
-  // Optional: clear cached permissions (MetaMask-supported)
     if (window.ethereum?.request) {
-      window.ethereum.request({
-        method: 'wallet_revokePermissions',
-        params: [{ eth_accounts: {} }],
-      }).catch(() => {
-        // silently ignore
-      });
+      window.ethereum
+        .request({
+          method: 'wallet_revokePermissions',
+          params: [{ eth_accounts: {} }],
+        })
+        .catch(() => {});
     }
     showAlert('Wallet disconnected', 'success');
   };
@@ -418,7 +463,7 @@ function App() {
   };
 
   const updateNFT = (id: string, updates: Partial<NFT>) => {
-    setNfts(nfts.map(nft => nft.id === id ? { ...nft, ...updates } : nft));
+    setNfts((prev) => prev.map((nft) => (nft.id === id ? { ...nft, ...updates } : nft)));
   };
 
   const addCollection = (collection: Collection) => {
