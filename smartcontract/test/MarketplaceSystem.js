@@ -61,7 +61,7 @@ describe("NFT Marketplace Comprehensive System Test", function () {
     });
 
     it("Should distribute funds correctly (Seller, Royalty, Platform)", async function () {
-      await marketplace.connect(buyer).buy(0, { value: PRICE });
+      await marketplace.connect(buyer).buy(1, { value: PRICE });
 
       // Calculations:
       // Price: 1.0 ETH
@@ -92,10 +92,10 @@ describe("NFT Marketplace Comprehensive System Test", function () {
 
     it("Should allow outbidding and handle refunds via Pull Pattern", async function () {
       const bid1 = ethers.parseEther("0.6");
-      await marketplace.connect(bidder1).bid(0, { value: bid1 });
+      await marketplace.connect(bidder1).bid(1, { value: bid1 });
 
       const bid2 = ethers.parseEther("0.7");
-      await marketplace.connect(bidder2).bid(0, { value: bid2 });
+      await marketplace.connect(bidder2).bid(1, { value: bid2 });
 
       // Bidder 1 should have their 0.6 ETH in pending withdrawals
       expect(await marketplace.pendingWithdrawals(bidder1.address)).to.equal(bid1);
@@ -112,7 +112,7 @@ describe("NFT Marketplace Comprehensive System Test", function () {
       await ethers.provider.send("evm_increaseTime", [3601]);
       await ethers.provider.send("evm_mine");
 
-      await marketplace.finalizeAuction(0);
+      await marketplace.finalizeAuction(1);
       expect(await nftCollection.ownerOf(1)).to.equal(creator.address);
     });
   });
@@ -123,12 +123,12 @@ describe("NFT Marketplace Comprehensive System Test", function () {
       await nftCollection.connect(creator).approve(await marketplace.getAddress(), 1);
       await marketplace.connect(creator).listFixedPrice(await nftCollection.getAddress(), 1, ethers.parseEther("1"));
       
-      await marketplace.connect(buyer).buy(0, { value: ethers.parseEther("1") });
+      await marketplace.connect(buyer).buy(1, { value: ethers.parseEther("1") });
 
       await marketplace.connect(creator).withdraw();
       expect(await marketplace.pendingWithdrawals(creator.address)).to.equal(0);
       
-      await expect(marketplace.connect(creator).withdraw()).to.be.revertedWith("No funds");
+      await expect(marketplace.connect(creator).withdraw()).to.be.revertedWith("No funds to withdraw");
     });
   });
 });
